@@ -84,23 +84,33 @@ jobs:
               done
           echo "done"
 
-  production-a:
+  approve-production:
+    name: Deploy to production
     needs: [changes, staging-complete, supersede]
     if: ${{ !cancelled() && needs.staging-complete.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.supersede.result) }}
+    runs-on: ubuntu-latest
+    # The ONLY job on the reviewed environment: one approval, one Slack line.
+    environment: production
+    steps:
+      - run: echo "approved; fanning out to the production jobs"
+
+  production-a:
+    needs: [changes, staging-complete, supersede, approve-production]
+    if: ${{ !cancelled() && needs.approve-production.result == 'success' }}
     uses: ./.github/workflows/production.yml
     with: { service: a, timeout: 60 }
 
   production-b:
-    needs: [changes, staging-complete, supersede]
-    if: ${{ !cancelled() && needs.staging-complete.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.supersede.result) }}
+    needs: [changes, staging-complete, supersede, approve-production]
+    if: ${{ !cancelled() && needs.approve-production.result == 'success' }}
     uses: ./.github/workflows/production.yml
     with: { service: b, timeout: 2 }
 
   production-matrix:
-    needs: [changes, staging-complete, supersede]
-    if: ${{ !cancelled() && needs.staging-complete.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.supersede.result) }}
+    needs: [changes, staging-complete, supersede, approve-production]
+    if: ${{ !cancelled() && needs.approve-production.result == 'success' }}
     runs-on: ubuntu-latest
-    environment: production
+    environment: production-deploy
     strategy:
       fail-fast: false
       matrix:
@@ -118,7 +128,7 @@ jobs:
     # skipped in run 1.
     if: ${{ !cancelled() && needs.production-a.result == 'success' }}
     runs-on: ubuntu-latest
-    environment: production
+    environment: production-deploy
     steps:
       - run: echo "late job (second approval?)"
 
