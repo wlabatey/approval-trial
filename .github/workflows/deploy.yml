@@ -54,24 +54,33 @@ jobs:
       RUN_ID: ${{ github.run_id }}
       RUN_NUMBER: ${{ github.run_number }}
     steps:
-      - name: Cancel every other waiting run of this workflow on main
+      - name: Cancel every other run whose production stage has not started
         run: |
           set -euo pipefail
           wf="${WORKFLOW_REF%@*}"; wf="${wf##*/}"
           echo "workflow file: $wf"
-          gh run list --workflow "$wf" --branch main --status waiting \
-              --limit 100 --json databaseId,number \
+          # Sweep every other unfinished run of this workflow on main. A run past
+          # staging whose production jobs are waiting (approval) or pending
+          # (queued behind a waiting run's concurrency group) is superseded by
+          # this one. A run with a production job in progress is an approved
+          # deploy and is never touched. A run still in staging is left alone:
+          # it will run its own sweep when it gets here.
+          gh run list --workflow "$wf" --branch main --limit 50 --json databaseId,number,status \
             | jq -r --argjson me "$RUN_ID" \
-                '.[] | select(.databaseId != $me) | "\(.databaseId) \(.number)"' \
-            | while read -r id number; do
-                status="$(gh run view "$id" --json status --jq .status)"
-                if [ "$status" != "waiting" ]; then
-                  echo "Run #$number ($id) is now '$status'; leaving it"
-                  continue
+                '.[] | select(.status != "completed" and .databaseId != $me) | "\(.databaseId) \(.number) \(.status)"' \
+            | while read -r id number status; do
+                jobs="$(gh run view "$id" --json jobs --jq '.jobs')"
+                staging_done="$(jq -r '[.[] | select(.name == "staging-complete" and .status == "completed")] | length' <<<"$jobs")"
+                prod_running="$(jq -r '[.[] | select((.name | startswith("production")) and .status == "in_progress")] | length' <<<"$jobs")"
+                if [ "$staging_done" = "0" ]; then
+                  echo "Run #$number ($id, $status): still in staging; leaving it"
+                elif [ "$prod_running" != "0" ]; then
+                  echo "Run #$number ($id, $status): production in progress; leaving it"
+                else
+                  echo "Cancelling run #$number ($id, $status): superseded by #$RUN_NUMBER"
+                  gh run cancel "$id"
+                  echo "cancelled #$number ($status)" >> "$GITHUB_STEP_SUMMARY"
                 fi
-                echo "Cancelling run #$number ($id): superseded by #$RUN_NUMBER"
-                gh run cancel "$id"
-                echo "cancelled #$number" >> "$GITHUB_STEP_SUMMARY"
               done
           echo "done"
 
@@ -104,6 +113,10 @@ jobs:
 
   production-late:
     needs: [production-a]
+    # Explicit guard: the implicit success() is poisoned by the skipped
+    # `supersede` job upstream (transitive skip), which is why this job was
+    # skipped in run 1.
+    if: ${{ !cancelled() && needs.production-a.result == 'success' }}
     runs-on: ubuntu-latest
     environment: production
     steps:
