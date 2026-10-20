@@ -1,0 +1,35 @@
+name: staging (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+      sleep:
+        type: number
+        required: true
+
+jobs:
+  build:
+    name: Build ${{ inputs.service }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: staging-build-${{ inputs.service }}
+      queue: max
+    steps:
+      - run: |
+          echo "build ${{ inputs.service }} (sleep ${{ inputs.sleep }})"
+          sleep ${{ inputs.sleep }}
+
+  deploy:
+    name: Deploy ${{ inputs.service }} to staging
+    needs: [build]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: staging-deploy-${{ inputs.service }}
+      queue: max
+    steps:
+      - run: |
+          echo "deploy ${{ inputs.service }} to staging"
+          sleep 10

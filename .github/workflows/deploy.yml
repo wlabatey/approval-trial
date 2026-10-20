@@ -1,0 +1,131 @@
+name: Deploy
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# No workflow-level concurrency on purpose: a run waiting for production
+# approval would hold the group and block the next run's staging stage.
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "run=$GITHUB_RUN_NUMBER sha=$GITHUB_SHA"
+
+  staging-a:
+    needs: [changes]
+    uses: ./.github/workflows/staging.yml
+    with: { service: a, sleep: 45 }
+
+  staging-b:
+    needs: [changes]
+    uses: ./.github/workflows/staging.yml
+    with: { service: b, sleep: 5 }
+
+  staging-complete:
+    needs: [staging-a, staging-b]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Move staging tags
+        run: |
+          set -euo pipefail
+          echo "staging-a=${{ needs.staging-a.result }} staging-b=${{ needs.staging-b.result }}"
+          git push --force origin "HEAD:refs/tags/staging/a" "HEAD:refs/tags/staging/b"
+
+  supersede:
+    needs: [staging-complete]
+    if: ${{ !cancelled() && needs.staging-complete.result == 'success' && vars.SUPERSEDE_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      WORKFLOW_REF: ${{ github.workflow_ref }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_NUMBER: ${{ github.run_number }}
+    steps:
+      - name: Cancel every other waiting run of this workflow on main
+        run: |
+          set -euo pipefail
+          wf="${WORKFLOW_REF%@*}"; wf="${wf##*/}"
+          echo "workflow file: $wf"
+          gh run list --workflow "$wf" --branch main --status waiting \
+              --limit 100 --json databaseId,number \
+            | jq -r --argjson me "$RUN_ID" \
+                '.[] | select(.databaseId != $me) | "\(.databaseId) \(.number)"' \
+            | while read -r id number; do
+                status="$(gh run view "$id" --json status --jq .status)"
+                if [ "$status" != "waiting" ]; then
+                  echo "Run #$number ($id) is now '$status'; leaving it"
+                  continue
+                fi
+                echo "Cancelling run #$number ($id): superseded by #$RUN_NUMBER"
+                gh run cancel "$id"
+                echo "cancelled #$number" >> "$GITHUB_STEP_SUMMARY"
+              done
+          echo "done"
+
+  production-a:
+    needs: [changes, staging-complete, supersede]
+    if: ${{ !cancelled() && needs.staging-complete.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.supersede.result) }}
+    uses: ./.github/workflows/production.yml
+    with: { service: a, timeout: 60 }
+
+  production-b:
+    needs: [changes, staging-complete, supersede]
+    if: ${{ !cancelled() && needs.staging-complete.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.supersede.result) }}
+    uses: ./.github/workflows/production.yml
+    with: { service: b, timeout: 2 }
+
+  production-matrix:
+    needs: [changes, staging-complete, supersede]
+    if: ${{ !cancelled() && needs.staging-complete.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.supersede.result) }}
+    runs-on: ubuntu-latest
+    environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [x, y, z]
+    concurrency:
+      group: production-matrix-${{ matrix.name }}
+      cancel-in-progress: false
+    steps:
+      - run: echo "matrix ${{ matrix.name }} deployed"
+
+  production-late:
+    needs: [production-a]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo "late job (second approval?)"
+
+  production-complete:
+    needs: [production-a, production-b, production-matrix, production-late]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Move prod tags and summarise
+        run: |
+          set -euo pipefail
+          {
+            echo "## Production results"
+            echo "- a: ${{ needs.production-a.result }}"
+            echo "- b: ${{ needs.production-b.result }}"
+            echo "- matrix: ${{ needs.production-matrix.result }}"
+            echo "- late: ${{ needs.production-late.result }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "${{ needs.production-a.result }}" = success ] && git push --force origin "HEAD:refs/tags/prod/a" || true
+          [ "${{ needs.production-b.result }}" = success ] && git push --force origin "HEAD:refs/tags/prod/b" || true

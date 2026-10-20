@@ -1,0 +1,25 @@
+name: production (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+      timeout:
+        type: number
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.service }} to production
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: ${{ inputs.timeout }}
+    concurrency:
+      group: production-${{ inputs.service }}
+      cancel-in-progress: false
+    steps:
+      - run: |
+          echo "deploy ${{ inputs.service }} to production"
+          sleep 20
